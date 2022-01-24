@@ -6,11 +6,6 @@ import (
 	"sort"
 )
 
-type Cursor struct {
-	bucket *Bucket   // 使用该句柄来进行 node 的加载
-	stack  []elemRef // 保留路径，方便回溯
-}
-
 // elemRef 表示对给定 page/node 上元素的引用。
 type elemRef struct {
 	node  *node
@@ -30,6 +25,43 @@ func (r *elemRef) count() int {
 		return len(r.node.inodes)
 	}
 	return int(r.page.count)
+}
+
+type Cursor struct {
+	bucket *Bucket   // 使用该句柄来进行 node 的加载
+	stack  []elemRef // 保留路径，方便回溯 []{node1, page1, page2, node2, node3, page3, node4, ...}
+}
+
+// Cursor 的开放接口
+// Bucket() 返回持有当前 Cursor 的Bucket对象
+// First()  返回持有当前 Cursor 的 Bucket 的第一个 K/V
+// Last()   返回持有当前 Cursor 的 Bucket 的最后一个 K/V
+// Prev()   返回持有当前 Cursor 所在位置的 Bucket 的前一个 K/V
+// Next()   返回持有当前 Cursor 所在位置的 Bucket 的下一个 K/V
+// Seek()   返回持有当前 Cursor 的 Bucket 的某个指定 key 的 K/V
+// Delete() 删除持有当前 Cursor 的 Bucket 的某个指定 key 的 K/V
+
+// 返回持有当前游标的 Bucket对象
+func (c *Cursor) Bucket() *Bucket {
+	return c.bucket
+}
+
+// keyValue returns the key and value of the current leaf element(叶子).
+func (c *Cursor) keyValue() ([]byte, []byte, uint32) {
+	// 最后一个节点是叶子节点
+	ref := &c.stack[len(c.stack)-1] // stack是一条路径 node->node->node->leaf
+	if ref.count() == 0 || ref.index >= ref.count() {
+		return nil, nil, 0
+	}
+
+	// 首先从内存中取
+	if ref.node != nil {
+		inode := &ref.node.inodes[ref.index]
+		return inode.key, inode.value, inode.flags
+	}
+	// 然后从文件page中取
+	elem := ref.page.leafPageElement(uint16(ref.index))
+	return elem.key(), elem.value(), elem.flags
 }
 
 // 定位到并返回该 bucket 第一个 KV
@@ -116,7 +148,7 @@ func (c *Cursor) last() {
 	}
 }
 
-// 定位到并返回该 bucket 下一个 KV
+// 定位到并返回 当前Cursor所在位置的 下一个 KV
 // 再此我们从当前位置查找前一个或者下一个时，需要注意一个问题:
 // 如果当前节点中元素已经完了，那么此时需要回退到遍历路径的上一个节点
 func (c *Cursor) Next() (key []byte, value []byte) {
@@ -169,20 +201,19 @@ func (c *Cursor) next() (key []byte, value []byte, flags uint32) {
 	}
 }
 
-// 定位到并返回该 bucket 前一个 KV
+// 定位到并返回 当前Cursor所在位置的 上一个 KV
 func (c *Cursor) Prev() (key []byte, value []byte) {
 	_assert(c.bucket.tx.db != nil, "tx closed")
-	// TODO 和next() 将 var i 声明在外有什么区别
 	// Attempt to move back one element until we're successful.
 	// Move up the stack as we hit the beginning of each page in our stack.
 	for i := len(c.stack) - 1; i >= 0; i-- {
 		elem := &c.stack[i]
-		if elem.index > 0 {
+		if elem.index > 0 { // elem.index 是当前 elem 在inodes中的位置 > 0 说明不是第一个 不需要向上找了
 			// 往前移动一格
 			elem.index--
 			break
 		}
-		c.stack = c.stack[:i]
+		c.stack = c.stack[:i] // 清理路径 作为终止条件
 	}
 	// If we've hit the end then return nil.
 	if len(c.stack) == 0 {
@@ -200,43 +231,6 @@ func (c *Cursor) Prev() (key []byte, value []byte) {
 		return k, nil
 	}
 	return k, v
-}
-
-func (c *Cursor) Delete() error {
-	if c.bucket.tx.db == nil {
-		return ErrTxClosed
-	} else if !c.bucket.Writable() {
-		return ErrTxNotWritable
-	}
-	key, _, flags := c.keyValue()
-	// Return an error if current value is a bucket.
-	if (flags & bucketLeafFlag) != 0 {
-		return ErrIncompatibleValue
-	}
-	// 从node中移除，本质上将inode数组进行移动
-	c.node().del(key)
-	return nil
-}
-
-// TODO 关注一下这个函数
-func (c *Cursor) node() *node {
-	_assert(len(c.stack) > 0, "accessing a node a zero-length cursor stack")
-	// If the top of the stack is a leaf node then just return it
-	if ref := &c.stack[len(c.stack)-1]; ref.node != nil && ref.isLeaf() {
-		return ref.node
-	}
-	// 不是叶子节点
-	var n = c.stack[0].node
-	if n == nil {
-		n = c.bucket.node(c.stack[0].page.id, nil)
-	}
-
-	for _, ref := range c.stack[:len(c.stack)-1] {
-		_assert(!n.isLeaf, "expected branch node")
-		n = n.childAt(ref.index)
-	}
-	_assert(n.isLeaf, "expected leaf node")
-	return n
 }
 
 // Seek 搜寻
@@ -282,29 +276,11 @@ func (c *Cursor) seek(seek []byte) (key []byte, value []byte, flags uint32) {
 	return c.keyValue()
 }
 
-// keyValue returns the key and value of the current leaf element(叶子).
-func (c *Cursor) keyValue() ([]byte, []byte, uint32) {
-	// 最后一个节点是叶子节点
-	ref := &c.stack[len(c.stack)-1] // stack是一条路径 node->node->node->leaf
-	if ref.count() == 0 || ref.index >= ref.count() {
-		return nil, nil, 0
-	}
-
-	// 首先从内存中取
-	if ref.node != nil {
-		inode := &ref.node.inodes[ref.index]
-		return inode.key, inode.value, inode.flags
-	}
-	// 然后从文件page中取
-	elem := ref.page.leafPageElement(uint16(ref.index))
-	return elem.key(), elem.value(), elem.flags
-}
-
 // 尾递归，查询 key 所在的 node，并且在 cursor 中记下路径
 func (c *Cursor) search(key []byte, pgid pgid) {
 	// root, 3
 	// 层层找page bucket->tx->db->dataref
-	p, n := c.bucket.pageNode(pgid) // 从根节点开始 返回 root 的 page 和 node
+	p, n := c.bucket.pageNode(pgid) // 从根节点开始 返回 root 的 page / node
 	if p != nil && (p.flags&(branchPageFlag|leafPageFlag)) == 0 {
 		panic(fmt.Sprintf("incalid page type: %d: %x", p.id, p.flags))
 	}
@@ -318,6 +294,7 @@ func (c *Cursor) search(key []byte, pgid pgid) {
 		return
 	}
 
+	// 如果不是叶子而是分支
 	if n != nil {
 		// 先搜索node，因为node是加载到内存中的
 		c.searchNode(key, n) // 这个函数中有递归调用 search
@@ -327,7 +304,7 @@ func (c *Cursor) search(key []byte, pgid pgid) {
 	c.searchPage(key, p)
 }
 
-// 搜索叶子page
+// 搜索叶子节点(一个数组) 中是否有 key
 func (c *Cursor) nsearch(key []byte) {
 	e := &c.stack[len(c.stack)-1]
 	p, n := e.page, e.node
@@ -391,4 +368,41 @@ func (c *Cursor) searchPage(key []byte, p *page) {
 	c.stack[len(c.stack)-1].index = index
 	// 继续递归
 	c.search(key, inodes[index].pgid)
+}
+
+func (c *Cursor) Delete() error {
+	if c.bucket.tx.db == nil {
+		return ErrTxClosed
+	} else if !c.bucket.Writable() {
+		return ErrTxNotWritable
+	}
+	key, _, flags := c.keyValue()
+	// Return an error if current value is a bucket.
+	if (flags & bucketLeafFlag) != 0 {
+		return ErrIncompatibleValue
+	}
+	// 从node中移除，本质上将inode数组进行移动
+	c.node().del(key)
+	return nil
+}
+
+// 返回当前 Cursor 所在位置的node
+func (c *Cursor) node() *node {
+	_assert(len(c.stack) > 0, "accessing a node a zero-length cursor stack")
+	// If the top of the stack is a leaf node then just return it
+	if ref := &c.stack[len(c.stack)-1]; ref.node != nil && ref.isLeaf() {
+		return ref.node
+	}
+	// 不是叶子节点
+	var n = c.stack[0].node
+	if n == nil {
+		n = c.bucket.node(c.stack[0].page.id, nil)
+	}
+
+	for _, ref := range c.stack[:len(c.stack)-1] {
+		_assert(!n.isLeaf, "expected branch node")
+		n = n.childAt(ref.index)
+	}
+	_assert(n.isLeaf, "expected leaf node")
+	return n
 }
