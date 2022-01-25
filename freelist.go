@@ -11,22 +11,7 @@ type freelist struct {
 	ids []pgid
 	// 将来很快被释放的空闲页 部分事务可能在读或者写
 	pending map[txid][]pgid // mapping of soon-to-be free ids by tx
-	cache   map[pgid]bool   // fast lookup of all free and pending page ids
-}
-
-type pgids []pgid
-
-// 为了可以排序需要实现的接口
-func (s pgids) Len() int {
-	return len(s)
-}
-
-func (s pgids) Swap(i, j int) {
-	s[i], s[j] = s[j], s[i]
-}
-
-func (s pgids) Less(i, j int) bool {
-	return s[i] < s[j]
+	cache   map[pgid]bool   // 记录所有 空闲或者即将空闲的 pgid
 }
 
 // newfreelista 返回一个空的初始化过的freelist
@@ -35,6 +20,122 @@ func newFreelist() *freelist {
 		pending: make(map[txid][]pgid),
 		cache:   make(map[pgid]bool),
 	}
+}
+
+// 返回作为 page.ptr(freelist Ver.) 的大小
+func (f *freelist) size() int {
+	n := f.count()
+	if n >= 0xFFFF {
+		n++ // 第一个位置用来记录freelist的统计值
+	}
+	return pageHeaderSize + (int(unsafe.Sizeof(pgid(0))) * n)
+}
+
+func (f *freelist) count() int {
+	return f.free_count() + f.pending_count()
+}
+
+func (f *freelist) free_count() int {
+	return len(f.ids)
+}
+
+func (f *freelist) pending_count() (count int) {
+	for k := range f.pending {
+		count += len(f.pending[k])
+	}
+	return
+}
+
+// 合并 f.ids 和 f.pending中的所有pgids
+func (f *freelist) copyall(dst []pgid) {
+	m := make(pgids, 0, f.pending_count())
+	// 首先把pending状态的页放到一个数组中，并使其有序
+	for _, list := range f.pending {
+		m = append(m, list...)
+	}
+	sort.Sort(m)
+	// 合并两个有序的空闲列表，最后结果输出到dst中
+	mergepgids(dst, f.ids, m)
+}
+
+// 开始分配一段连续的n个页。其中返回值为初始的页id。如果无法分配，则返回0即可
+// [5,6,7,(13,14,15,16),18,19,20,31,32] n == 4
+func (f *freelist) allocate(n int) pgid {
+	if len(f.ids) == 0 {
+		return 0
+	}
+	var initial, previd pgid
+	for i, id := range f.ids {
+		if id <= 1 {
+			panic(fmt.Errorf("invalid page allocation: %d", id))
+		}
+
+		// 第一次不连续时记录一下第一个位置
+		if previd == 0 || id-previd != 1 {
+			initial = id
+		}
+		// 找到了连续的块，然后将其返回即可
+		if (id-initial)+1 == pgid(n) {
+			if (i + 1) == n {
+				// 找到的是前n个连续的空间
+				f.ids = f.ids[i+1:]
+			} else {
+				// 更新ids的内容
+				copy(f.ids[i-n+1:], f.ids[i+1:])
+				f.ids = f.ids[:len(f.ids)-n]
+			}
+			// 同时更新缓存
+			for i := pgid(0); i < pgid(n); i++ {
+				delete(f.cache, initial+i)
+			}
+			return initial
+		}
+		previd = id
+	}
+	return 0
+}
+
+// free 解除 txid 的page及其overflow的占用 标志它们随时可以被使用 不允许二次释放
+func (f *freelist) free(txid txid, p *page) {
+	if p.id <= 1 {
+		panic(fmt.Sprintf("connot free page 0 or 1: %d", p.id))
+	}
+
+	var ids = f.pending[txid]
+	for id := p.id; id <= p.id+pgid(p.overflow); id++ {
+		if f.cache[id] {
+			panic(fmt.Sprintf("page %d already freed", id))
+		}
+		ids = append(ids, id)
+		f.cache[id] = true
+	}
+	f.pending[txid] = ids
+}
+
+// 将 <= txid的事务占用的page全部释放到 f的空闲列表中
+func (f *freelist) release(txid txid) {
+	m := make(pgids, 0)
+	for tid, ids := range f.pending {
+		if tid <= txid {
+			m = append(m, ids...)
+			delete(f.pending, tid)
+		}
+	}
+	sort.Sort(m)
+	f.ids = pgids(f.ids).merge(m)
+}
+
+// rollback 移除 txid的所有page 并且不回收到空闲列表 仿佛没有存在过
+func (f *freelist) rollback(txid txid) {
+	for _, id := range f.pending[txid] {
+		delete(f.cache, id)
+	}
+
+	delete(f.pending, txid)
+}
+
+func (f *freelist) freed(pgid pgid) bool {
+	return f.cache[pgid]
 }
 
 // 从磁盘中读取空闲页信息 并转换为freelist结构
@@ -65,21 +166,6 @@ func (f *freelist) read(p *page) {
 
 }
 
-func (f *freelist) reindex() {
-	f.cache = make(map[pgid]bool, len(f.ids))
-	// TODO 这里的id应该是包含pendingid的?
-	for _, id := range f.ids {
-		f.cache[id] = true
-	}
-
-	// TODO 搞清楚这里的f.pending有没有东西 为什么有/没有
-	for _, pendingIDs := range f.pending {
-		for _, pendingID := range pendingIDs {
-			f.cache[pendingID] = true
-		}
-	}
-}
-
 // 将freelist信息写入到page中
 func (f *freelist) write(p *page) error {
 	// Update the header flag
@@ -102,135 +188,39 @@ func (f *freelist) write(p *page) error {
 	return nil
 }
 
-func (f *freelist) copyall(dst []pgid) {
-	m := make(pgids, 0, f.pending_count())
-	// 首先把pending状态的页放到一个数组中，并使其有序
-	for _, list := range f.pending {
-		m = append(m, list...)
-	}
-	sort.Sort(m)
-	// 合并两个有序的列表，最后结果输出到dst中
-	// TODO 一旦准备落盘 则说明该页这些事务已经执行完了?
-	mergepgids(dst, f.ids, m)
-}
-
-// 将a和b按照有序合并成到dst中，a和b有序
-func mergepgids(dst, a, b pgids) {
-	if len(dst) < len(a)+len(b) {
-		panic(fmt.Errorf("mergepgids bad len %d < %d + %d", len(dst), len(a), len(b)))
-	}
-	// Copy in the opposite slice if one is nil
-	if len(a) == 0 {
-		copy(dst, b)
-		return
-	}
-
-	if len(b) == 0 {
-		copy(dst, a)
-		return
-	}
-
-	// Merged will hold all elements from both lists.
-	merged := dst[:0]
-
-	lead, follow := a, b
-	if b[0] < a[0] {
-		lead, follow = b, a
-	}
-	// Continue while there are elements in the lead.
-	for len(lead) > 0 {
-		// Merge largest prefix of lead that is ahead of follow[0].
-		n := sort.Search(len(lead), func(i int) bool { return lead[i] > follow[0] })
-		merged = append(merged, lead[:n]...)
-		if n >= len(lead) {
-			break
-		}
-		// Swap lead and follow.
-		lead, follow = follow, lead[n:]
-	}
-	// Append what's left in follow.
-	_ = append(merged, follow...)
-}
-
-func (f *freelist) size() int {
-	n := f.count()
-	if n >= 0xFFFF {
-		n++ // 第一个位置被用作记录count了
-	}
-	return pageHeaderSize + (int(unsafe.Sizeof(pgid(0))) * n)
-}
-
-func (f *freelist) count() int {
-	return f.free_count() + f.pending_count()
-}
-
-func (f *freelist) free_count() int {
-	return len(f.ids)
-}
-
-func (f *freelist) pending_count() (count int) {
-	for k := range f.pending {
-		count += len(f.pending[k])
-	}
-	return
-}
-
-// 开始分配一段连续的n个页。其中返回值为初始的页id。如果无法分配，则返回0即可
-// [5,6,7,(13,14,15,16),18,19,20,31,32] n == 4
-func (f *freelist) allocate(n int) pgid {
-	if len(f.ids) == 0 {
-		return 0
-	}
-	var initial, previd pgid
-	for i, id := range f.ids {
-		if id <= 1 {
-			panic(fmt.Errorf("invalid page allocation: %d", id))
-		}
-
-		// Reset initial page if this is not contiguous(连续)
-		if previd == 0 || id-previd != 1 {
-			// 第一次不连续时记录一下第一个位置
-			initial = id
-		}
-		// 找到了连续的块，然后将其返回即可
-		if (id-initial)+1 == pgid(n) {
-			if (i + 1) == n {
-				// 找到的是前n个连续的空间
-				f.ids = f.ids[i+1:]
-			} else {
-				// 更新ids的内容
-				copy(f.ids[i-n+1:], f.ids[i+1:])
-				f.ids = f.ids[:len(f.ids)-n]
-			}
-			// Remove from the free cache.
-			// 同时更新缓存
-			for i := pgid(0); i < pgid(n); i++ {
-				delete(f.cache, initial+i)
-			}
-			return initial
-		}
-		previd = id
-	}
-	return 0
-}
-
-func (f *freelist) free(txid txid, p *page) {
-	// TODO
-}
-
-func (f *freelist) release(txid txid) {
-	// TODO
-}
-
-func (f *freelist) rollback(txid txid) {
-	// TODO
-}
-
-func (f *freelist) freed(pgid pgid) bool {
-	// TODO
-	return f.cache[pgid]
-}
-
+// reload 从页面读取空闲列表并过滤掉待处理的项目。
 func (f *freelist) reload(p *page) {
-	// TODO
+	f.read(p)
+
+	pcache := make(map[pgid]bool)
+	for _, pendingIDs := range f.pending {
+		for _, pendingID := range pendingIDs {
+			pcache[pendingID] = true
+		}
+	}
+
+	var a []pgid
+	for _, id := range f.ids {
+		if !pcache[id] {
+			a = append(a, id)
+		}
+	}
+	f.ids = a
+
+	// 一旦freeList被重建，就重建 freeCache，使其包括可用和待处理的空闲页面。
+	f.reindex()
+
+}
+
+func (f *freelist) reindex() {
+	f.cache = make(map[pgid]bool, len(f.ids))
+	for _, id := range f.ids {
+		f.cache[id] = true
+	}
+
+	for _, pendingIDs := range f.pending {
+		for _, pendingID := range pendingIDs {
+			f.cache[pendingID] = true
+		}
+	}
 }
