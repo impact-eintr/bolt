@@ -3,18 +3,18 @@ package main
 import (
 	"log"
 
-	"github.com/impact-eintr/bolt"
+	ebolt "github.com/impact-eintr/bolt"
 )
 
 func main() {
 	// 我们的大柜子
-	db, err := bolt.Open("./my.db", 0600, nil)
+	db, err := ebolt.Open("./my.db", 0600, nil)
 	if err != nil {
 		panic(err)
 	}
 	defer db.Close()
 	// 往db里面插入数据
-	err = db.Update(func(tx *bolt.Tx) error {
+	err = db.Update(func(tx *ebolt.Tx) error {
 		//我们的小柜子
 		bucket, err := tx.CreateBucketIfNotExists([]byte("user"))
 		if err != nil {
@@ -32,7 +32,7 @@ func main() {
 		log.Fatalf("db.Update err:%s", err.Error())
 	}
 	// 从db里面读取数据
-	err = db.View(func(tx *bolt.Tx) error {
+	err = db.View(func(tx *ebolt.Tx) error {
 		//找到柜子
 		bucket := tx.Bucket([]byte("user"))
 		//找东西
@@ -45,4 +45,5 @@ func main() {
 	if err != nil {
 		log.Fatalf("db.View err:%s", err.Error())
 	}
+
 }

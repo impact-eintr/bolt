@@ -95,7 +95,7 @@ func (f *freelist) allocate(n int) pgid {
 	return 0
 }
 
-// free 解除 txid 的page及其overflow的占用 标志它们随时可以被使用 不允许二次释放
+// free 解除 txid 的 page 及其overflow的占用 标志它们随时可以被使用 不允许二次释放
 func (f *freelist) free(txid txid, p *page) {
 	if p.id <= 1 {
 		panic(fmt.Sprintf("connot free page 0 or 1: %d", p.id))
@@ -112,7 +112,7 @@ func (f *freelist) free(txid txid, p *page) {
 	f.pending[txid] = ids
 }
 
-// 将 <= txid的事务占用的page全部释放到 f的空闲列表中
+// 将 小于等于 txid 的事务占用的page全部释放到 f的空闲列表中
 func (f *freelist) release(txid txid) {
 	m := make(pgids, 0)
 	for tid, ids := range f.pending {
@@ -147,7 +147,7 @@ func (f *freelist) read(p *page) {
 	if count == 0xFFFF {
 		idx = 1
 		// 用第一个uint64来存储整个count的值
-		count = int((*[maxAllocSize]pgid)(unsafe.Pointer(&p.ptr))[0])
+		count = int(((*[maxAllocSize]pgid)(unsafe.Pointer(&p.ptr)))[0])
 	}
 
 	// 这里已经取出真实的count
@@ -177,6 +177,7 @@ func (f *freelist) write(p *page) error {
 	if lenids == 0 {
 		p.count = uint16(lenids)
 	} else if lenids < 0xFFFF {
+		p.count = uint16(lenids)
 		f.copyall(((*[maxAllocSize]pgid)(unsafe.Pointer(&p.ptr)))[:])
 	} else {
 		// 有溢出的情况下 后一个元素放置其长度 然后在存放所有的pgid列表
@@ -188,7 +189,7 @@ func (f *freelist) write(p *page) error {
 	return nil
 }
 
-// reload 从页面读取空闲列表并过滤掉待处理的项目。
+// reload 从页面读取空闲列表并过滤掉待处理的项目  重新从freelist页中读取构建空闲列表
 func (f *freelist) reload(p *page) {
 	f.read(p)
 
